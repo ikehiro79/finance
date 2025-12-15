@@ -1,4 +1,5 @@
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -7,219 +8,193 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# =========================
-# Yahoo Finance endpoints
-# =========================
-YF_BOOTSTRAP_URL = "https://finance.yahoo.com"  # cookie取得用
+YF_BOOTSTRAP_URL = "https://finance.yahoo.com"
 YF_GETCRUMB_URL  = "https://query2.finance.yahoo.com/v1/test/getcrumb"
 YF_QUOTE_URL     = "https://query2.finance.yahoo.com/v7/finance/quote"
 
 JST = ZoneInfo("Asia/Tokyo")
 
 
-# =========================
-# Utility
-# =========================
 def normalize_symbol(line: str) -> str | None:
     s = (line or "").strip()
     if not s or s.startswith("#"):
         return None
-    # 4桁だけなら東証(.T)を自動付与（必要に応じてルール変更可）
     if s.isdigit() and len(s) == 4:
         return f"{s}.T"
     return s
 
 
 def load_symbols_from_text(text: str) -> list[str]:
-    symbols = []
+    syms = []
     for line in (text or "").splitlines():
         sym = normalize_symbol(line)
         if sym:
-            symbols.append(sym)
-    # 重複排除＆ソート
-    return sorted(set(symbols))
+            syms.append(sym)
+    return sorted(set(syms))
 
 
 def chunk_list(items: list[str], size: int) -> list[list[str]]:
-    return [items[i : i + size] for i in range(0, len(items), size)]
+    return [items[i:i+size] for i in range(0, len(items), size)]
 
 
 def fmt_jst_from_epoch(epoch: int | None) -> str | None:
     if not epoch:
         return None
-    dt = datetime.fromtimestamp(epoch, tz=JST)
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(epoch, tz=JST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-# =========================
-# Yahoo session + crumb
-# =========================
-def get_yahoo_session() -> requests.Session:
-    """
-    1ユーザー(1セッション)ごとに requests.Session を持つ
-    """
-    if "yf_sess" not in st.session_state:
-        s = requests.Session()
-        # それっぽいブラウザヘッダを付与（弾かれにくくする）
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-            "Referer": "https://finance.yahoo.com/",
-            "Connection": "keep-alive",
-        })
-        # まずトップへアクセスしてcookieを得る
-        s.get(YF_BOOTSTRAP_URL, timeout=15)
-        st.session_state["yf_sess"] = s
-        st.session_state["yf_crumb"] = None
-        st.session_state["yf_crumb_ts"] = 0.0
-
-    return st.session_state["yf_sess"]
+class YahooRateLimitError(RuntimeError):
+    pass
 
 
-def get_crumb(sess: requests.Session, max_age_sec: int = 1800) -> str:
-    """
-    crumb は cookie と紐づくので、セッション内で一定時間キャッシュ
-    """
-    now = time.time()
-    crumb = st.session_state.get("yf_crumb")
-    ts = st.session_state.get("yf_crumb_ts", 0.0)
+@dataclass
+class YahooClient:
+    session: requests.Session
+    crumb: str | None = None
+    crumb_ts: float = 0.0
 
-    if crumb and (now - ts) < max_age_sec:
-        return crumb
+    # アプリ全体で共有キャッシュ（IP共有環境で効く）
+    last_df: pd.DataFrame | None = None
+    last_fetch_ts: float = 0.0
 
-    # 取得が空になることもあるので、最大2回試す
-    for _ in range(2):
-        r = sess.get(YF_GETCRUMB_URL, timeout=15)
+    def _bootstrap(self) -> None:
+        self.session.get(YF_BOOTSTRAP_URL, timeout=15)
+
+    def _get_crumb(self, max_age_sec: int = 1800) -> str:
+        now = time.time()
+        if self.crumb and (now - self.crumb_ts) < max_age_sec:
+            return self.crumb
+
+        # 429対策：指数バックオフで最大3回だけ再試行
+        backoffs = [1.0, 2.0, 4.0]
+        for i, sleep_sec in enumerate([0.0] + backoffs):
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+
+            r = self.session.get(YF_GETCRUMB_URL, timeout=15)
+
+            if r.status_code == 429:
+                # 連打しない。次のバックオフへ
+                continue
+
+            r.raise_for_status()
+            crumb = (r.text or "").strip()
+            if crumb:
+                self.crumb = crumb
+                self.crumb_ts = time.time()
+                return crumb
+
+            # crumbが空なら cookie 取り直し
+            self._bootstrap()
+
+        raise YahooRateLimitError("Yahoo側のレート制限(429)により crumb を取得できませんでした。")
+
+    def _quote_chunk(self, symbols: list[str]) -> list[dict]:
+        """
+        重要：最初は crumb無しで試す（= getcrumb の呼び出し回数を減らす）
+        """
+        params = {"symbols": ",".join(symbols)}
+        r = self.session.get(YF_QUOTE_URL, params=params, timeout=15)
+
+        if r.status_code == 429:
+            raise YahooRateLimitError("Yahoo側のレート制限(429)により quote を取得できませんでした。")
+
+        # 401/403 のときだけ crumb を取りに行く
+        if r.status_code in (401, 403):
+            crumb = self._get_crumb()
+            params["crumb"] = crumb
+            r = self.session.get(YF_QUOTE_URL, params=params, timeout=15)
+
+        if r.status_code == 429:
+            raise YahooRateLimitError("Yahoo側のレート制限(429)により quote を取得できませんでした。")
+
         r.raise_for_status()
-        crumb = (r.text or "").strip()
-        if crumb:
-            st.session_state["yf_crumb"] = crumb
-            st.session_state["yf_crumb_ts"] = now
-            return crumb
+        data = r.json()
+        return data.get("quoteResponse", {}).get("result", [])
 
-        # crumbが空ならbootstrapし直して再試行
-        sess.get(YF_BOOTSTRAP_URL, timeout=15)
+    def get_quotes_df(self, symbols: list[str], chunk_size: int) -> pd.DataFrame:
+        all_results: list[dict] = []
+        for c in chunk_list(symbols, chunk_size):
+            all_results.extend(self._quote_chunk(c))
 
-    raise RuntimeError("crumb の取得に失敗しました（Yahoo側でブロックされている可能性があります）")
+        rows = []
+        got = set()
+        for q in all_results:
+            sym = q.get("symbol")
+            got.add(sym)
+            rows.append({
+                "symbol": sym,
+                "name": q.get("shortName") or q.get("longName"),
+                "price": q.get("regularMarketPrice"),
+                "change": q.get("regularMarketChange"),
+                "change_pct": q.get("regularMarketChangePercent"),
+                "market_state": q.get("marketState"),
+                "volume": q.get("regularMarketVolume"),
+                "currency": q.get("currency"),
+                "time_jst": fmt_jst_from_epoch(q.get("regularMarketTime")),
+            })
+
+        # 未取得銘柄の行（デバッグ用）
+        missing = [s for s in symbols if s not in got]
+        for s in missing:
+            rows.append({"symbol": s})
+
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.sort_values("symbol").reset_index(drop=True)
+        return df
+
+    def get_quotes_df_cached(self, symbols: list[str], chunk_size: int, ttl_sec: int, force: bool) -> pd.DataFrame:
+        now = time.time()
+        if (not force) and self.last_df is not None and (now - self.last_fetch_ts) < ttl_sec:
+            return self.last_df
+
+        df = self.get_quotes_df(symbols, chunk_size)
+        self.last_df = df
+        self.last_fetch_ts = now
+        return df
 
 
-def quote_once(sess: requests.Session, symbols: list[str]) -> list[dict]:
-    """
-    quote APIを1回叩く（symbolsは小分け済みを想定）
-    401/403が出たら crumb/cookie を更新して1回だけ再試行
-    """
-    crumb = get_crumb(sess)
-    params = {"symbols": ",".join(symbols), "crumb": crumb}
-    r = sess.get(YF_QUOTE_URL, params=params, timeout=15)
-
-    if r.status_code in (401, 403):
-        # cookie/crumbリフレッシュしてリトライ
-        st.session_state["yf_crumb"] = None
-        sess.get(YF_BOOTSTRAP_URL, timeout=15)
-        crumb = get_crumb(sess)
-        params["crumb"] = crumb
-        r = sess.get(YF_QUOTE_URL, params=params, timeout=15)
-
-    r.raise_for_status()
-    data = r.json()
-    return data.get("quoteResponse", {}).get("result", [])
-
-
-def build_df_from_results(results: list[dict], requested_symbols: list[str]) -> pd.DataFrame:
-    rows = []
-    got = set()
-
-    for q in results:
-        sym = q.get("symbol")
-        got.add(sym)
-
-        rows.append({
-            "symbol": sym,
-            "name": q.get("shortName") or q.get("longName"),
-            "price": q.get("regularMarketPrice"),
-            "change": q.get("regularMarketChange"),
-            "change_pct": q.get("regularMarketChangePercent"),
-            "market_state": q.get("marketState"),
-            "volume": q.get("regularMarketVolume"),
-            "currency": q.get("currency"),
-            "time_jst": fmt_jst_from_epoch(q.get("regularMarketTime")),
-        })
-
-    # 取得できなかった銘柄があれば行を追加（原因特定しやすくする）
-    missing = [s for s in requested_symbols if s not in got]
-    for s in missing:
-        rows.append({
-            "symbol": s,
-            "name": None,
-            "price": None,
-            "change": None,
-            "change_pct": None,
-            "market_state": None,
-            "volume": None,
-            "currency": None,
-            "time_jst": None,
-        })
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("symbol").reset_index(drop=True)
-    return df
+@st.cache_resource
+def get_client() -> YahooClient:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://finance.yahoo.com/",
+        "Connection": "keep-alive",
+    })
+    client = YahooClient(session=s)
+    client._bootstrap()
+    return client
 
 
 # =========================
-# Caching (global)
-# =========================
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_quotes_cached(symbols_tuple: tuple[str, ...], chunk_size: int) -> pd.DataFrame:
-    """
-    st.cache_data は（基本）全ユーザー共通キャッシュになります。
-    共有IP環境では問い合わせ削減に効きます。
-    """
-    symbols = list(symbols_tuple)
-    sess = get_yahoo_session()
-
-    all_results: list[dict] = []
-    for chunk in chunk_list(symbols, chunk_size):
-        all_results.extend(quote_once(sess, chunk))
-
-    return build_df_from_results(all_results, symbols)
-
-
-# =========================
-# Streamlit UI
+# UI
 # =========================
 st.set_page_config(page_title="Yahoo 現在値ビューア", layout="wide")
 st.title("Yahoo Finance 現在値（tickers.txt 読み込み）")
 
 with st.sidebar:
     st.header("設定")
-    ttl = st.number_input("キャッシュTTL（秒）", min_value=10, max_value=600, value=60, step=10)
-    chunk_size = st.number_input("一括取得の分割数（銘柄/リクエスト）", min_value=10, max_value=200, value=80, step=10)
+    ttl_sec = st.number_input("アプリ内キャッシュTTL（秒）", min_value=30, max_value=3600, value=180, step=30)
+    chunk_size = st.number_input("一括取得の分割（銘柄/リクエスト）", min_value=10, max_value=200, value=60, step=10)
 
-    st.caption("共有IP環境では TTL を長め（60〜180秒）推奨です。")
+    st.divider()
+    uploaded = st.file_uploader("tickers.txt をアップロード（任意）", type=["txt"])
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("キャッシュ破棄", use_container_width=True):
-            st.cache_data.clear()
+        force = st.button("強制更新", use_container_width=True)
     with col2:
-        if st.button("cookie/crumb 再取得", use_container_width=True):
-            st.session_state.pop("yf_sess", None)
-            st.session_state.pop("yf_crumb", None)
-            st.session_state.pop("yf_crumb_ts", None)
+        reset = st.button("cookie/crumb リセット", use_container_width=True)
 
-    st.divider()
-    st.subheader("銘柄リスト")
-    uploaded = st.file_uploader("tickers.txt をアップロード（任意）", type=["txt"])
-    st.caption("形式: 1行1銘柄。4桁のみなら .T を自動付与。先頭 # はコメント。")
-
-# TTLを変更したらキャッシュを破棄（ttlはデコレータ固定のため）
-if "last_ttl" not in st.session_state:
-    st.session_state["last_ttl"] = ttl
-elif st.session_state["last_ttl"] != ttl:
-    st.cache_data.clear()
-    st.session_state["last_ttl"] = ttl
+client = get_client()
+if reset:
+    # セッションを作り直すのが一番確実
+    st.cache_resource.clear()
+    st.rerun()
 
 # tickers.txt 読み込み
 tickers_text = None
@@ -231,50 +206,26 @@ else:
         tickers_text = p.read_text(encoding="utf-8", errors="ignore")
 
 if not tickers_text:
-    st.warning("tickers.txt が見つかりません。サイドバーからアップロードするか、リポジトリ直下に配置してください。")
+    st.warning("tickers.txt が見つかりません。アップロードするか、リポジトリ直下に配置してください。")
     st.stop()
 
 symbols = load_symbols_from_text(tickers_text)
-
-# 表示
 st.write(f"読み込み銘柄数: **{len(symbols)}**")
-with st.expander("読み込んだ銘柄一覧（先頭100件）", expanded=False):
-    st.code("\n".join(symbols[:100]) + ("\n..." if len(symbols) > 100 else ""))
-
 if not symbols:
-    st.warning("銘柄が0件です。tickers.txt の内容を確認してください。")
     st.stop()
 
-# 取得ボタン（自動で毎回取りに行くと弾かれやすいのでボタン式）
-if "run_fetch" not in st.session_state:
-    st.session_state["run_fetch"] = True
-
-colA, colB = st.columns([1, 3])
-with colA:
-    do_fetch = st.button("現在値を取得", type="primary", use_container_width=True)
-with colB:
-    st.caption("ボタンを押したタイミングで取得します（リロード連打を避けるため）。")
-
-if do_fetch:
+if st.button("現在値を取得", type="primary"):
     try:
-        df = fetch_quotes_cached(tuple(symbols), int(chunk_size))
-        st.subheader("結果")
+        df = client.get_quotes_df_cached(symbols, int(chunk_size), int(ttl_sec), force=bool(force))
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # 簡易サマリ
-        valid = df["price"].notna().sum()
-        missing = df["price"].isna().sum()
-        st.write(f"取得成功: **{valid}** / 失敗(空): **{missing}**")
+        ok = df["price"].notna().sum() if "price" in df.columns else 0
+        st.write(f"取得成功: **{ok}** / 全件: **{len(df)}**")
 
-        if missing:
-            st.info("price が空の行は、銘柄コード（サフィックス含む）の誤り、またはYahoo側のブロックの可能性があります。")
-
+    except YahooRateLimitError as e:
+        st.error(str(e))
+        st.info("対策：TTLを長くする（例 180〜300秒）、強制更新の多用を避ける、分割数を小さくする（例 40〜60）。")
     except requests.HTTPError as e:
         st.error(f"HTTPエラー: {e}")
-        st.write("対策候補:")
-        st.write("- キャッシュTTLを長くする（60〜180秒）")
-        st.write("- 分割数（銘柄/リクエスト）を小さくする（例: 50）")
-        st.write("- cookie/crumb 再取得ボタンを押してから再実行")
     except Exception as e:
         st.error(f"エラー: {e}")
-        st.write("Community Cloud では共有IP等でYahoo側にブロックされる場合があります。時間を置く/TTLを伸ばす/データソース変更も検討してください。")
